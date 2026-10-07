@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/bridgeandroutingpanel.tsx","./src/components/calibrationmodal.tsx","./src/components/devicecards.tsx","./src/components/residualtimingchart.tsx","./src/components/roomstage.tsx","./src/lib/audiosim.ts","./src/lib/bridgeinstaller.ts","./src/lib/devices.ts","./src/lib/store.ts"],"version":"5.6.3"}
