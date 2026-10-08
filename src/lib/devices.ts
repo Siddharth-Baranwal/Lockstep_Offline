@@ -144,6 +144,8 @@ export interface PotatoParameterOptions {
   eqBarDb: EqBands
   eqTowerDb: EqBands
   mono?: boolean
+  /** Omit delay assignments when another layer owns delay control. */
+  includeDelay?: boolean
 }
 
 /** Build the semicolon-delimited ASCII assignment string accepted by VBVMR_SetParameters. */
@@ -151,8 +153,10 @@ export function buildSetParametersScript(params: PotatoParameterOptions): string
   const parts = [
     `Strip[${Math.trunc(params.stripIndex)}].A1=${params.stripA1 ? 1 : 0}`,
     `Strip[${Math.trunc(params.stripIndex)}].A2=${params.stripA2 ? 1 : 0}`,
-    `Option.delay[0]=${Math.round(clampDelayMs(params.delayBarMs))}`,
-    `Option.delay[1]=${Math.round(clampDelayMs(params.delayTowerMs))}`,
+    ...(params.includeDelay === false ? [] : [
+      `Option.delay[0]=${Math.round(clampDelayMs(params.delayBarMs))}`,
+      `Option.delay[1]=${Math.round(clampDelayMs(params.delayTowerMs))}`,
+    ]),
     `Bus[0].Gain=${clampGainDb(params.gainBarDb).toFixed(1)}`,
     `Bus[1].Gain=${clampGainDb(params.gainTowerDb).toFixed(1)}`,
     `Bus[0].EQ.cell[0].gain=${params.eqBarDb[0].toFixed(1)}`,

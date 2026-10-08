@@ -39,14 +39,14 @@ export default function App() {
   function commitTrim(value = trimDraftRef.current) {
     if (trimCommitTimer.current !== undefined) window.clearTimeout(trimCommitTimer.current)
     trimCommitTimer.current = undefined
-    const boundedValue = Math.max(-40, Math.min(40, Number(value.toFixed(1))))
+    const boundedValue = Math.max(-100, Math.min(100, Math.round(value)))
     trimDraftRef.current = boundedValue
     setTrimDraft(boundedValue)
-    engine.setManualTrim(boundedValue)
+    engine.setManualTrimMs(boundedValue)
   }
 
   function stageTrim(value: number) {
-    const nextValue = Math.max(-40, Math.min(40, Number(value.toFixed(1))))
+    const nextValue = Math.max(-100, Math.min(100, Math.round(value)))
     trimDraftRef.current = nextValue
     setTrimDraft(nextValue)
     if (!trimPointerActive.current) {
@@ -118,12 +118,12 @@ export default function App() {
             <button type="button" className="trim-step-button" onClick={() => commitTrim(trimDraftRef.current - 1)} aria-label="Decrease manual trim by 1 millisecond">−</button>
             <input
               type="range"
-              min={-40}
-              max={40}
-              step={0.1}
+              min={-100}
+              max={100}
+              step={1}
               value={trimDraft}
               aria-label="Manual timing trim"
-              style={{ '--range-progress': `${((trimDraft + 40) / 80) * 100}%` } as CSSProperties}
+              style={{ '--range-progress': `${((trimDraft + 100) / 200) * 100}%` } as CSSProperties}
               onChange={(event) => stageTrim(Number(event.currentTarget.value))}
               onPointerDown={() => {
                 trimPointerActive.current = true

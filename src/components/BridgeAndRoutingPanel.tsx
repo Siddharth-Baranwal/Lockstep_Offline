@@ -32,8 +32,8 @@ export function BridgeAndRoutingPanel({ state, actions }: BridgeAndRoutingPanelP
     }
   }
 
-  const bridgeTone = state.connection === 'live' ? 'text-lime-300' : state.connection === 'connecting' ? 'text-amber-300' : 'text-zinc-400'
-  const bridgeLabel = state.connection === 'live' ? 'Bridge connected' : state.connection === 'connecting' ? 'Checking bridge' : 'Simulation mode'
+  const bridgeTone = state.connection === 'live' ? 'text-lime-300' : state.commandError?.includes('outdated') ? 'text-amber-300' : state.connection === 'connecting' ? 'text-amber-300' : 'text-zinc-400'
+  const bridgeLabel = state.connection === 'live' ? `Bridge v${state.bridgeVersion ?? '?'}` : state.commandError?.includes('outdated') ? 'Outdated bridge' : state.connection === 'connecting' ? 'Checking bridge' : 'Simulation mode'
 
   return (
     <section className="panel" aria-labelledby="bridge-title">
@@ -43,7 +43,7 @@ export function BridgeAndRoutingPanel({ state, actions }: BridgeAndRoutingPanelP
           <h2 id="bridge-title" className="panel-title">Bridge & routing</h2>
         </div>
         <span className={`inline-flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider ${bridgeTone}`}>
-          <span className={`h-1.5 w-1.5 rounded-full ${state.connection === 'live' ? 'bg-lime-400 shadow-[0_0_8px_#a3e635]' : state.connection === 'connecting' ? 'animate-pulse bg-amber-400' : 'bg-zinc-500'}`} />
+          <span className={`h-1.5 w-1.5 rounded-full ${state.connection === 'live' ? 'bg-lime-400 shadow-[0_0_8px_#a3e635]' : state.connection === 'connecting' || state.commandError?.includes('outdated') ? 'animate-pulse bg-amber-400' : 'bg-zinc-500'}`} />
           {bridgeLabel}
         </span>
       </div>
@@ -51,6 +51,7 @@ export function BridgeAndRoutingPanel({ state, actions }: BridgeAndRoutingPanelP
       <div className="grid grid-cols-2 gap-2">
         <Diagnostic label="Endpoint" value="127.0.0.1:4780" mono />
         <Diagnostic label="Voicemeeter" value={state.connection === 'live' ? 'Potato · Kind 3' : 'Not detected'} />
+        <Diagnostic label="A1 delay writes" value={state.delayWriteCount === null ? '—' : String(state.delayWriteCount)} mono />
       </div>
 
       <div className="mt-3 rounded-lg border border-white/[0.06] bg-black/20 p-3">

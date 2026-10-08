@@ -68,12 +68,16 @@ export interface LockstepState {
   lastCommand: string | null
   commandError: string | null
   lastBridgePollAt: number | null
+  bridgeVersion: number | null
+  delayWriteCount: number | null
   calibration: CalibrationState
   audioAudition: boolean
 }
 
 interface BridgeTelemetry {
   t?: unknown
+  bridgeVersion?: unknown
+  delayWriteCount?: unknown
   conn?: unknown
   autopilot?: unknown
   mode?: unknown
@@ -88,6 +92,8 @@ export interface LockstepActions {
   stop: () => void
   reconnect: () => void
   setMode: (mode: ListeningModeId) => void
+  setManualTrimMs: (trimMs: number) => void
+  /** Compatibility alias for components using the earlier action name. */
   setManualTrim: (trimMs: number) => void
   setGain: (device: DeviceId, gainDb: number) => void
   setEqBand: (device: DeviceId, band: 0 | 1 | 2, gainDb: number) => void
@@ -132,6 +138,8 @@ const initialState: LockstepState = {
   lastCommand: null,
   commandError: null,
   lastBridgePollAt: null,
+  bridgeVersion: null,
+  delayWriteCount: null,
   calibration: initialCalibration(),
   audioAudition: false,
 }
@@ -144,6 +152,9 @@ let loopStartedAt = 0
 let pollInFlight = false
 let commandInFlight = false
 let mountedConsumers = 0
+let bridgeProfileQueue: Promise<void> = Promise.resolve()
+let pendingBridgeProfileCommands = 0
+let bridgeSupportsTrimSync = false
 let instantaneousResidualMs = 0
 let smoothedResidualMs = 0
 let hasResidualSample = false
@@ -198,6 +209,9 @@ function currentCommand(): string {
     eqBarDb: state.eqDb.soundbar,
     eqTowerDb: state.eqDb.party,
     mono: mode.mono,
+    // The bridge owns physical Option.delay writes. This script carries only
+    // routing, gain, EQ and mode changes so a second controller cannot fight it.
+    includeDelay: false,
   })
 }
 
@@ -218,7 +232,12 @@ function finiteNumber(value: unknown, fallback: number): number {
 
 function applyBridgeTelemetry(payload: BridgeTelemetry): void {
   if (payload.t !== 'state') throw new Error('Bridge returned an unknown state payload.')
-  const bridgeDevices = payload.devices ?? {}
+  bridgeSupportsTrimSync = finiteNumber(payload.bridgeVersion, 0) >= 3
+  const bridgeIsLive = payload.conn === 'live' && bridgeSupportsTrimSync
+  const shouldSyncBridgeProfile = bridgeIsLive && state.connection !== 'live'
+  // A bridge generated before trim synchronization may keep restoring A1 to
+  // 48 ms. Treat it as simulation-only so the app cannot join that write war.
+  const bridgeDevices = bridgeSupportsTrimSync ? payload.devices ?? {} : {}
   const mergedDevices = { ...state.devices }
   for (const id of ['soundbar', 'party'] as const) {
     const incoming = bridgeDevices[id]
@@ -236,12 +255,20 @@ function applyBridgeTelemetry(payload: BridgeTelemetry): void {
   hasResidualSample = true
   publish({
     ...state,
-    connection: payload.conn === 'live' ? 'live' : 'offline',
+    connection: bridgeIsLive ? 'live' : payload.conn === 'live' ? 'simulated' : 'offline',
     autopilot: typeof payload.autopilot === 'boolean' ? payload.autopilot : state.autopilot,
     devices: mergedDevices,
     lastBridgePollAt: now,
-    commandError: null,
+    bridgeVersion: finiteNumber(payload.bridgeVersion, 0),
+    delayWriteCount: bridgeSupportsTrimSync ? finiteNumber(payload.delayWriteCount, 0) : null,
+    commandError: payload.conn === 'live' && !bridgeSupportsTrimSync
+      ? 'This bridge is outdated and cannot control delay safely. Download a fresh bridge, close the old bridge window, and run the new Lockstep-Bridge.bat.'
+      : null,
   })
+  if (shouldSyncBridgeProfile) {
+    queueBridgeProfileCommand('setMode', { mode: state.mode })
+    queueBridgeProfileCommand('setTrim', { ms: state.manualTrimMs })
+  }
 }
 
 function calculateResidual(devices: Record<DeviceId, DeviceTelemetry>, driftMs = 0, jitterMs = 0): number {
@@ -261,6 +288,7 @@ async function pollBridge(): Promise<void> {
     const payload = await requestJson<BridgeTelemetry>(`${BRIDGE_ORIGIN}/`)
     applyBridgeTelemetry(payload)
   } catch {
+    bridgeSupportsTrimSync = false
     patchState({
       connection: state.connection === 'connecting' || state.connection === 'live' ? 'simulated' : state.connection,
       lastBridgePollAt: Date.now(),
@@ -271,6 +299,7 @@ async function pollBridge(): Promise<void> {
 }
 
 async function postCommand(script: string): Promise<boolean> {
+  if (state.connection !== 'live' || !bridgeSupportsTrimSync) return false
   if (commandInFlight) return false
   commandInFlight = true
   try {
@@ -290,11 +319,55 @@ async function postCommand(script: string): Promise<boolean> {
   }
 }
 
+async function sendBridgeCommand(
+  cmdType: 'setTrim' | 'setMode',
+  payload: { ms: number } | { mode: ListeningModeId },
+): Promise<boolean> {
+  if (state.connection !== 'live' || !bridgeSupportsTrimSync) return false
+  try {
+    const response = await requestJson<{ ok?: boolean; message?: string }>(`${BRIDGE_ORIGIN}/cmd`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmdType, ...payload }),
+    })
+    if (response.ok !== true) throw new Error(response.message || `Bridge rejected ${cmdType}.`)
+    patchState({ commandError: null })
+    return true
+  } catch (error) {
+    patchState({ commandError: error instanceof Error ? error.message : `Could not send ${cmdType} to the bridge.` })
+    return false
+  }
+}
+
+function queueBridgeProfileCommand(
+  cmdType: 'setTrim' | 'setMode',
+  payload: { ms: number } | { mode: ListeningModeId },
+): void {
+  if (state.connection !== 'live' || !bridgeSupportsTrimSync) return
+  pendingBridgeProfileCommands += 1
+  bridgeProfileQueue = bridgeProfileQueue
+    .then(async () => { await sendBridgeCommand(cmdType, payload) })
+    .catch(() => undefined)
+    .then(() => { pendingBridgeProfileCommands = Math.max(0, pendingBridgeProfileCommands - 1) })
+}
+
+function setManualTrimMs(ms: number): void {
+  const clamped = Math.max(-100, Math.min(100, Math.round(Number.isFinite(ms) ? ms : 0)))
+  // Keep the trim as a controller target. The 20 Hz loop slews the delay
+  // instead of abruptly jumping the Juke Bar's Voicemeeter delay line.
+  patchState({ manualTrimMs: clamped })
+  queueBridgeProfileCommand('setTrim', { ms: clamped })
+}
+
 function scheduleCurrentCommand(): void {
   if (queuedCommandTimer) clearTimeout(queuedCommandTimer)
   queuedCommandTimer = setTimeout(() => {
     queuedCommandTimer = undefined
     if (state.connection !== 'live') return
+    if (pendingBridgeProfileCommands > 0) {
+      scheduleCurrentCommand()
+      return
+    }
     if (commandInFlight) {
       scheduleCurrentCommand()
       return
@@ -312,7 +385,7 @@ function makeControlFrame(now: number): void {
   const devices = { ...state.devices }
   const target = getTargetDelays(LISTENING_MODES[state.mode], state.manualTrimMs)
   const diff = target.soundbar - devices.soundbar.delayMs
-  if (state.autopilot) {
+  if (state.autopilot && !isLive && pendingBridgeProfileCommands === 0) {
     const nextDelay = Math.abs(diff) <= DELAY_SETTLE_DEADBAND_MS
       ? target.soundbar
       : devices.soundbar.delayMs + Math.sign(diff) * Math.min(Math.abs(diff), MAX_SLEW_PER_STEP_MS)
@@ -382,7 +455,7 @@ function makeControlFrame(now: number): void {
   if (state.audioAudition) updateAudition()
   // Send each small 20 Hz slew increment to hardware. Manual trim itself is
   // committed only after interaction ends, so this never mirrors slider noise.
-  if (state.connection === 'live' && state.autopilot) {
+  if (state.connection === 'live' && state.autopilot && pendingBridgeProfileCommands === 0) {
     const script = currentCommand()
     if (script !== state.lastCommand && !commandInFlight) void postCommand(script)
   }
@@ -495,6 +568,9 @@ async function advanceCalibration(): Promise<boolean> {
       party: { ...state.devices.party, delayMs: 0, gainDb: -2.4 },
     },
   })
+  queueBridgeProfileCommand('setMode', { mode: 'seamless' })
+  queueBridgeProfileCommand('setTrim', { ms: 0 })
+  await bridgeProfileQueue
   const success = await sendCurrentProfile()
   publish({
     ...state,
@@ -523,10 +599,12 @@ const actions: LockstepActions = {
   setMode(mode) {
     if (!(mode in LISTENING_MODES)) return
     patchState({ mode, eqDb: LISTENING_MODES[mode].eqDb })
+    queueBridgeProfileCommand('setMode', { mode })
     scheduleCurrentCommand()
   },
+  setManualTrimMs,
   setManualTrim(trimMs) {
-    patchState({ manualTrimMs: clamp(trimMs, -40, 40) })
+    setManualTrimMs(trimMs)
   },
   setGain(device, gainDb) {
     const normalizedGain = clampGainDb(gainDb)

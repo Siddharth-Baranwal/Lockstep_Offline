@@ -15,6 +15,7 @@ using System.ComponentModel;
 using Microsoft.Win32;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public static class LockstepBridgeEngine {
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -39,7 +40,67 @@ public static class LockstepBridgeEngine {
   private static readonly CultureInfo Invariant = CultureInfo.InvariantCulture;
   private static bool loggedIn = false;
   private static bool autopilot = false;
+  private static bool delayControlEnabled = false;
+  private static volatile bool stopping = false;
   private static string mode = "seamless";
+  private static double trimMs = 0.0;
+  private static double targetDelayBarMs = 48.0;
+  private static int delayWriteCount = 0;
+
+  private static double DelayBiasForMode(string modeId) {
+    switch ((modeId ?? "").ToLowerInvariant()) {
+      case "cinema": return -4.0;
+      case "karaoke": return 4.0;
+      default: return 0.0;
+    }
+  }
+  // Keep the bridge's expected A1 delay in sync with the UI trim. Hardware
+  // changes are still performed in small increments by the store's 20 Hz slew.
+  private static void ApplyModeToPotato() {
+    targetDelayBarMs = Math.Max(0.0, Math.Min(500.0, Math.Round(48.0 + DelayBiasForMode(mode) + trimMs)));
+  }
+  // This is the sole physical delay writer. Keeping the slew in the bridge
+  // avoids a browser controller and a bridge watchdog pulling A1 in opposite
+  // directions through Voicemeeter's output delay buffer.
+  private static void DelayControlLoop() {
+    while (!stopping) {
+      try {
+        lock (Gate) {
+          if (loggedIn && delayControlEnabled) {
+            float current;
+            if (GetParameterFloat("Option.delay[0]", out current) == 0) {
+              double difference = targetDelayBarMs - current;
+              if (Math.Abs(difference) >= 0.5) {
+                double next = Math.Abs(difference) <= 1.0
+                  ? targetDelayBarMs
+                  : current + Math.Sign(difference) * 1.0;
+                int rounded = (int)Math.Round(Math.Max(0.0, Math.Min(500.0, next)));
+                if (Math.Abs(rounded - Math.Round(current)) >= 1.0 && SetParameters("Option.delay[0]=" + rounded.ToString(Invariant)) == 0) {
+                  delayWriteCount++;
+                }
+              }
+            }
+          }
+        }
+      } catch {}
+      Thread.Sleep(50);
+    }
+  }
+  private static string ExtractJsonString(string json, string key, string fallback) {
+    try {
+      string pattern = "\\\"" + System.Text.RegularExpressions.Regex.Escape(key) + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"";
+      System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(json, pattern);
+      return match.Success ? match.Groups[1].Value : fallback;
+    } catch { return fallback; }
+  }
+  private static double ExtractJsonDouble(string json, string key, double fallback) {
+    try {
+      string pattern = "\\\"" + System.Text.RegularExpressions.Regex.Escape(key) + "\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)";
+      System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(json, pattern);
+      double value;
+      return match.Success && Double.TryParse(match.Groups[1].Value, NumberStyles.Float, Invariant, out value) ? value : fallback;
+    } catch { return fallback; }
+  }
 
   private static string DirectoryFromRegistry(RegistryView view) {
     try {
@@ -112,8 +173,10 @@ public static class LockstepBridgeEngine {
       float coherence = (float)Math.Max(0.0, Math.Min(1.0, Math.Exp(-Math.Abs(residual) / 28.0) - 0.1));
       string conn = loggedIn ? "live" : "offline";
       string lockState = Math.Abs(residual) <= 5.0f ? "locked" : "adjusting";
-      return "{\"t\":\"state\",\"conn\":\"" + conn + "\",\"autopilot\":" + (autopilot ? "true" : "false") +
+      return "{\"t\":\"state\",\"bridgeVersion\":3,\"conn\":\"" + conn + "\",\"autopilot\":" + (autopilot ? "true" : "false") +
         ",\"mode\":\"" + mode + "\",\"lock\":\"" + lockState + "\",\"residualMs\":" + N(residual) +
+        ",\"manualTrimMs\":" + trimMs.ToString("0", Invariant) + ",\"targetDelayBarMs\":" + targetDelayBarMs.ToString("0", Invariant) +
+        ",\"delayWriteCount\":" + delayWriteCount.ToString(Invariant) +
         ",\"coherence\":" + N(coherence) + ",\"devices\":{" +
         "\"soundbar\":{\"rmsDb\":" + N(barLevel) + ",\"delayMs\":" + N(barDelay) + ",\"gainDb\":" + N(barGain) + ",\"connected\":" + (loggedIn ? "true" : "false") + "}," +
         "\"party\":{\"rmsDb\":" + N(towerLevel) + ",\"delayMs\":" + N(towerDelay) + ",\"gainDb\":" + N(towerGain) + ",\"connected\":" + (loggedIn ? "true" : "false") + "}}}";
@@ -143,6 +206,7 @@ public static class LockstepBridgeEngine {
         throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows could not add the Voicemeeter install folder to the DLL search path: " + installDirectory);
       }
       Console.WriteLine("Voicemeeter DLL found: " + Path.Combine(installDirectory, "VoicemeeterRemote64.dll"));
+      ApplyModeToPotato();
       int result = Login();
       int vmType = 0;
       loggedIn = result == 0 && GetVoicemeeterType(out vmType) == 0 && vmType == 3;
@@ -156,6 +220,10 @@ public static class LockstepBridgeEngine {
     listener.Prefixes.Add("http://127.0.0.1:4780/");
     try {
       listener.Start();
+      stopping = false;
+      Thread delayController = new Thread(new ThreadStart(DelayControlLoop));
+      delayController.IsBackground = true;
+      delayController.Start();
       Console.WriteLine("Lockstep bridge listening at http://127.0.0.1:4780/ (Ctrl+C to stop)");
       Console.WriteLine(loggedIn ? "Connected to Voicemeeter Potato." : "Voicemeeter unavailable; state endpoint remains available.");
       while (listener.IsListening) {
@@ -170,6 +238,32 @@ public static class LockstepBridgeEngine {
           if (method == "GET" && (path == "" || path == "/state")) { Reply(context, 200, StateJson()); continue; }
           if (method == "POST" && path == "/cmd") {
             string body = ReadBody(context.Request);
+            string cmdType = ExtractJsonString(body, "cmdType", "");
+            if (cmdType == "setTrim") {
+              double requestedTrim = ExtractJsonDouble(body, "ms", 0.0);
+              lock (Gate) {
+                trimMs = Math.Max(-100.0, Math.Min(100.0, Math.Round(requestedTrim)));
+                ApplyModeToPotato();
+                delayControlEnabled = true;
+                autopilot = true;
+              }
+              Reply(context, 200, "{\"ok\":true,\"manualTrimMs\":" + trimMs.ToString("0", Invariant) + ",\"targetDelayBarMs\":" + targetDelayBarMs.ToString("0", Invariant) + "}");
+              continue;
+            }
+            if (cmdType == "setMode") {
+              string requestedMode = ExtractJsonString(body, "mode", "seamless");
+              string[] supportedModes = new string[] { "seamless", "cinema", "party", "karaoke", "night" };
+              bool supported = false;
+              foreach (string supportedMode in supportedModes) if (String.Equals(supportedMode, requestedMode, StringComparison.OrdinalIgnoreCase)) supported = true;
+              if (!supported) { Reply(context, 400, "{\"ok\":false,\"message\":\"Unknown listening mode\"}"); continue; }
+              lock (Gate) {
+                mode = requestedMode.ToLowerInvariant();
+                ApplyModeToPotato();
+                if (delayControlEnabled) autopilot = true;
+              }
+              Reply(context, 200, "{\"ok\":true,\"mode\":\"" + mode + "\",\"targetDelayBarMs\":" + targetDelayBarMs.ToString("0", Invariant) + "}");
+              continue;
+            }
             string script = "";
             try {
               System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(body, "\\\"script\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"");
@@ -178,7 +272,10 @@ public static class LockstepBridgeEngine {
             if (script.Length == 0) { Reply(context, 400, "{\"ok\":false,\"error\":\"Missing script\"}"); continue; }
             int code = -1;
             if (loggedIn) { try { code = SetParameters(script); } catch { code = -1; } }
-            if (script.IndexOf("Option.delay[", StringComparison.OrdinalIgnoreCase) >= 0) autopilot = true;
+            if (script.IndexOf("Option.delay[", StringComparison.OrdinalIgnoreCase) >= 0) {
+              autopilot = true;
+              if (code == 0) lock (Gate) { delayWriteCount++; }
+            }
             string message = loggedIn ? (code == 0 ? "ok" : "Voicemeeter rejected command") : "Bridge is offline; command not applied";
             Reply(context, loggedIn && code == 0 ? 200 : 503, "{\"ok\":" + (loggedIn && code == 0 ? "true" : "false") + ",\"message\":\"" + message + "\"}");
             continue;
@@ -189,6 +286,7 @@ public static class LockstepBridgeEngine {
         }
       }
     } finally {
+      stopping = true;
       if (listener.IsListening) listener.Stop();
       listener.Close();
       if (loggedIn) { try { Logout(); } catch {} }
